@@ -3,11 +3,18 @@
   hosts: all
   become: yes
   vars:
+    vulnerable_sudo_versions:
+      - "1.8.8:1.8.32"  # For CVE-2025-32462
+      - "1.9.0:1.9.17"  # For CVE-2025-32462
+      - "1.9.14:1.9.17" # For CVE-2025-32463
     fixed_sudo_version: "1.9.17p1"
+    cve_list:
+      - "CVE-2025-32462"
+      - "CVE-2025-32463"
   tasks:
     - name: Gather package facts
       ansible.builtin.package_facts:
-        manager: dnf
+        manager: auto
 
     - name: Check current sudo version
       ansible.builtin.command: rpm -q sudo
@@ -17,34 +24,70 @@
     - name: Set sudo version fact
       ansible.builtin.set_fact:
         sudo_version: "{{ sudo_version_check.stdout | regex_replace('sudo-', '') | regex_replace('\\.el[0-9].*', '') }}"
+        final_sudo_version: "{{ sudo_version_check.stdout | regex_replace('sudo-', '') | regex_replace('\\.el[0-9].*', '') }}"
+
+    - name: Check sudo package changelog for CVE fixes
+      ansible.builtin.command: rpm -q --changelog sudo
+      register: sudo_changelog
+      changed_when: false
+
+    - name: Check if CVEs are fixed in changelog
+      ansible.builtin.set_fact:
+        cve_2025_32462_fixed: "{{ 'CVE-2025-32462' in sudo_changelog.stdout }}"
+        cve_2025_32463_fixed: "{{ 'CVE-2025-32463' in sudo_changelog.stdout }}"
+        cve_2025_32462_fixed_post_update: "{{ 'CVE-2025-32462' in sudo_changelog.stdout }}"
+        cve_2025_32463_fixed_post_update: "{{ 'CVE-2025-32463' in sudo_changelog.stdout }}"
 
     - name: Check if sudo version is vulnerable to CVE-2025-32462
       ansible.builtin.set_fact:
-        cve_2025_32462_vulnerable: "{{ sudo_version is version('1.8.8', '>=') and sudo_version is version('1.9.17', '<=') }}"
+        cve_2025_32462_vulnerable: "{{ not cve_2025_32462_fixed and (
+          (sudo_version is version('1.8.8', '>=') and sudo_version is version('1.8.32', '<=')) or
+          (sudo_version is version('1.9.0', '>=') and sudo_version is version('1.9.17', '<=')) ) }}"
 
     - name: Check if sudo version is vulnerable to CVE-2025-32463
       ansible.builtin.set_fact:
-        cve_2025_32463_vulnerable: "{{ sudo_version is version('1.9.14', '>=') and sudo_version is version('1.9.17', '<=') }}"
+        cve_2025_32463_vulnerable: "{{ not cve_2025_32463_fixed and
+          (sudo_version is version('1.9.14', '>=') and sudo_version is version('1.9.17', '<=')) }}"
 
     - name: Determine if update is needed
       ansible.builtin.set_fact:
         is_vulnerable: "{{ cve_2025_32462_vulnerable or cve_2025_32463_vulnerable }}"
+
+    - name: Debug vulnerability status
+      ansible.builtin.debug:
+        msg:
+          - "Vulnerability status for {{ inventory_hostname }}"
+          - "CVE-2025-32462 vulnerable: {{ cve_2025_32462_vulnerable }}"
+          - "CVE-2025-32463 vulnerable: {{ cve_2025_32463_vulnerable }}"
+          - "Is vulnerable: {{ is_vulnerable }}"
+          - "CVE-2025-32462 fixed: {{ cve_2025_32462_fixed }}"
+          - "CVE-2025-32463 fixed: {{ cve_2025_32463_fixed }}"
+
+    - name: Determine if manual verification is needed
+      ansible.builtin.set_fact:
+        manual_verification_needed: "{{ not (cve_2025_32462_fixed and cve_2025_32463_fixed) and
+          sudo_version is version(fixed_sudo_version, '<') and not is_vulnerable }}"
 
     - name: Report current sudo version and CVE status
       ansible.builtin.debug:
         msg:
           - "Host: {{ inventory_hostname }}"
           - "Current sudo version: {{ sudo_version }}"
-          - "CVE-2025-32462: {{ 'Vulnerable' if cve_2025_32462_vulnerable else 'Not Vulnerable' }}"
-          - "CVE-2025-32463: {{ 'Vulnerable' if cve_2025_32463_vulnerable else 'Not Vulnerable' }}"
-          - "Action required: {{ 'Update to sudo-1.9.17p1 or later' if is_vulnerable else 'No action needed' }}"
+          - "CVE-2025-32462: {{ 'Not Vulnerable (backported fix)' if cve_2025_32462_fixed else 'Vulnerable' if cve_2025_32462_vulnerable else 'Not Vulnerable' }}"
+          - "CVE-2025-32463: {{ 'Not Vulnerable (backported fix)' if cve_2025_32463_fixed else 'Vulnerable' if cve_2025_32463_vulnerable else 'Not Vulnerable' }}"
+          - "Action required: {{ 'Update sudo to latest available version (includes backported patches)' if is_vulnerable else 'Manual verification needed' if manual_verification_needed else 'No action needed' }}"
 
     - name: Update sudo package if vulnerable
-      ansible.builtin.dnf:
+      ansible.builtin.yum:
         name: sudo
         state: latest
       when: is_vulnerable
       register: sudo_update
+
+    - name: Debug yum update result
+      ansible.builtin.debug:
+        msg: "Yum update result: {{ sudo_update }}"
+      when: is_vulnerable
 
     - name: Re-check sudo version after update
       ansible.builtin.command: rpm -q sudo
@@ -52,21 +95,28 @@
       changed_when: false
       when: sudo_update.changed
 
-    - name: Report sudo version after update
-      ansible.builtin.debug:
-        msg: "Host {{ inventory_hostname }} updated to sudo version {{ sudo_version_post_update.stdout | regex_replace('sudo-', '') | regex_replace('\\.el[0-9].*', '') }}"
+    - name: Re-check changelog after update
+      ansible.builtin.command: rpm -q --changelog sudo
+      register: sudo_changelog_post_update
+      changed_when: false
+      when: sudo_update.changed
+
+    - name: Set updated CVE fix status
+      ansible.builtin.set_fact:
+        cve_2025_32462_fixed_post_update: "{{ 'CVE-2025-32462' in sudo_changelog_post_update.stdout }}"
+        cve_2025_32463_fixed_post_update: "{{ 'CVE-2025-32463' in sudo_changelog_post_update.stdout }}"
+        final_sudo_version: "{{ sudo_version_post_update.stdout | regex_replace('sudo-', '') | regex_replace('\\.el[0-9].*', '') }}"
       when: sudo_update.changed
 
     - name: Print report to stdout
       ansible.builtin.debug:
-        msg: |
-          Sudo CVE Report for {{ inventory_hostname }}
-          ---------------------------------------
-          Initial sudo version: {{ sudo_version }}
-          CVE-2025-32462: {{ 'Vulnerable' if cve_2025_32462_vulnerable else 'Not Vulnerable' }}
-          CVE-2025-32463: {{ 'Vulnerable' if cve_2025_32463_vulnerable else 'Not Vulnerable' }}
-          Updated: {{ 'Yes' if sudo_update.changed else 'No' }}
-          {% if sudo_update.changed %}
-          New sudo version: {{ sudo_version_post_update.stdout | regex_replace('sudo-', '') | regex_replace('\\.el[0-9].*', '') }}
-          {% endif %}
-          ---------------------------------------
+        msg:
+          - "Sudo CVE Report for {{ inventory_hostname }}"
+          - "---------------------------------------"
+          - "Initial sudo version: {{ sudo_version }}"
+          - "Final sudo version: {{ final_sudo_version }}"
+          - "CVE-2025-32462: {{ 'Not Vulnerable (backported fix)' if cve_2025_32462_fixed_post_update else 'Vulnerable' if cve_2025_32462_vulnerable else 'Not Vulnerable' }}"
+          - "CVE-2025-32463: {{ 'Not Vulnerable (backported fix)' if cve_2025_32463_fixed_post_update else 'Vulnerable' if cve_2025_32463_vulnerable else 'Not Vulnerable' }}"
+          - "Action taken: {{ 'Sudo updated to latest available version (includes backported patches)' if sudo_update.changed else 'No update performed (already latest or backported fixes detected)' }}"
+          - "Manual verification needed: {{ 'Yes' if manual_verification_needed and not is_vulnerable else 'No' }}"
+          - "---------------------------------------"
