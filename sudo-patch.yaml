@@ -1,122 +1,394 @@
 ---
-- name: Check and update sudo package on RHEL hosts for CVE-2025-32462 and CVE-2025-32463
+- name: Sudo CVE audit for CVE-2025-32462 and CVE-2025-32463
   hosts: all
+  gather_facts: yes
   become: yes
   vars:
-    vulnerable_sudo_versions:
-      - "1.8.8:1.8.32"  # For CVE-2025-32462
-      - "1.9.0:1.9.17"  # For CVE-2025-32462
-      - "1.9.14:1.9.17" # For CVE-2025-32463
-    fixed_sudo_version: "1.9.17p1"
-    cve_list:
-      - "CVE-2025-32462"
-      - "CVE-2025-32463"
+    supported_ubuntu:
+      - "20.04"
+      - "22.04"
+      - "24.04"
+      - "25.04"
+    supported_debian:
+      - "11"
+      - "12"
+    supported_rhel:
+      - "7"
+      - "8"
+      - "9"
+    fixed_versions:
+      CVE-2025-32462:
+        Ubuntu:
+          "20.04": "1.8.31-1ubuntu1.5+esm1"
+          "22.04": "1.9.9-1ubuntu2.5"
+          "24.04": "1.9.15p5-3ubuntu5.24.04.1"
+          "25.04": "1.9.15p5-3ubuntu5.25.04.1"
+        Debian:
+          "11": "1.9.5p2-3+deb11u2"
+          "12": "1.9.13p3-1+deb12u2"
+        RedHat:
+          "7": "1.8.23-10"
+          "8": "1.9.5p2-1"
+          "9": "1.9.5p2-10"
+        CentOS:
+          "7": "1.8.23-10"
+          "8": "1.9.5p2-1"
+          "9": "1.9.5p2-10"
+        AlmaLinux:
+          "8": "1.9.5p2-1"
+          "9": "1.9.5p2-10"
+        Rocky:
+          "8": "1.9.5p2-1"
+          "9": "1.9.5p2-10"
+      CVE-2025-32463:
+        Ubuntu:
+          "20.04": "not affected"
+          "22.04": "not affected"
+          "24.04": "1.9.15p5-3ubuntu5.24.04.1"
+          "25.04": "1.9.15p5-3ubuntu5.25.04.1"
+        Debian:
+          "11": "not affected"
+          "12": "not affected"
+        RedHat:
+          "7": "not affected"
+          "8": "not affected"
+          "9": "not affected"
+        CentOS:
+          "7": "not affected"
+          "8": "not affected"
+          "9": "not affected"
+        AlmaLinux:
+          "8": "not affected"
+          "9": "not affected"
+        Rocky:
+          "8": "not affected"
+          "9": "not affected"
+
   tasks:
+    - name: Validate supported OS
+      fail:
+        msg: "Unsupported OS: {{ ansible_distribution }}. Supported OSes: Ubuntu, Debian, RedHat, CentOS, AlmaLinux, Rocky Linux."
+      when: ansible_distribution not in ["Ubuntu", "Debian", "RedHat", "CentOS", "AlmaLinux", "Rocky"]
+
+    - name: Set OS release version short
+      set_fact:
+        os_release_short: >-
+          {{ ansible_distribution_version if ansible_distribution == "Ubuntu" else
+             ansible_distribution_major_version | default(ansible_distribution_version.split('.')[0] | default('unknown')) if ansible_distribution == "Debian" else
+             ansible_distribution_version.split('.')[0] | default('unknown') if ansible_distribution in ["RedHat", "CentOS", "AlmaLinux", "Rocky"] else
+             ansible_distribution_version | default('unknown') }}
+
+    - name: Skip unsupported OS versions
+      fail:
+        msg: |
+          Unsupported {{ ansible_distribution }} version: {{ os_release_short }}.
+          Supported versions: {{ supported_ubuntu if ansible_distribution == 'Ubuntu' else supported_debian if ansible_distribution == 'Debian' else supported_rhel }}.
+      when: >
+        (ansible_distribution == "Ubuntu" and os_release_short not in supported_ubuntu) or
+        (ansible_distribution == "Debian" and os_release_short not in supported_debian) or
+        (ansible_distribution in ["RedHat", "CentOS", "AlmaLinux", "Rocky"] and os_release_short not in supported_rhel)
+
+    - name: Validate fixed_versions entry
+      fail:
+        msg: "No fixed_versions entry for {{ ansible_distribution }} {{ os_release_short }}."
+      when: >
+        ansible_distribution not in fixed_versions['CVE-2025-32462'] or
+        os_release_short not in fixed_versions['CVE-2025-32462'][ansible_distribution] or
+        ansible_distribution not in fixed_versions['CVE-2025-32463'] or
+        os_release_short not in fixed_versions['CVE-2025-32463'][ansible_distribution]
+
+    - name: Check if sudo is installed
+      command: which sudo
+      register: sudo_check
+      changed_when: false
+      failed_when: false
+      ignore_errors: true
+
+    - name: Fail if sudo is not installed
+      fail:
+        msg: "Sudo is not installed on {{ inventory_hostname }}."
+      when: sudo_check.rc != 0
+
     - name: Gather package facts
       ansible.builtin.package_facts:
         manager: auto
 
-    - name: Check current sudo version
-      ansible.builtin.command: rpm -q sudo
-      register: sudo_version_check
+    - name: Get detailed sudo version info
+      shell: |
+        if command -v rpm >/dev/null 2>&1; then
+          # For RPM systems, strip distribution-specific suffixes like .el8_9, .el9, etc.
+          rpm -q --queryformat '%{VERSION}-%{RELEASE}' sudo 2>/dev/null | sed 's/\.el[0-9][_0-9]*.*$//' || echo "unknown"
+        elif command -v dpkg >/dev/null 2>&1; then
+          dpkg-query -W -f='${Version}' sudo 2>/dev/null || echo "unknown"
+        else
+          echo "unknown"
+        fi
+      register: detailed_sudo_version
       changed_when: false
+      failed_when: false
 
-    - name: Set sudo version fact
-      ansible.builtin.set_fact:
-        sudo_version: "{{ sudo_version_check.stdout | regex_replace('sudo-', '') | regex_replace('\\.el[0-9].*', '') }}"
-        final_sudo_version: "{{ sudo_version_check.stdout | regex_replace('sudo-', '') | regex_replace('\\.el[0-9].*', '') }}"
+    - name: Set initial sudo version
+      set_fact:
+        initial_sudo_version: "{{ detailed_sudo_version.stdout | default('unknown') }}"
+        fixed_version_32462: "{{ fixed_versions['CVE-2025-32462'][ansible_distribution][os_release_short] }}"
+        fixed_version_32463: "{{ fixed_versions['CVE-2025-32463'][ansible_distribution][os_release_short] }}"
 
-    - name: Check sudo package changelog for CVE fixes
-      ansible.builtin.command: rpm -q --changelog sudo
-      register: sudo_changelog
+    - name: Set CVE affected status
+      set_fact:
+        cve_32462_not_affected: "{{ fixed_version_32462 == 'not affected' }}"
+        cve_32463_not_affected: "{{ fixed_version_32463 == 'not affected' }}"
+
+    - name: Check initial vulnerability for CVE-2025-32462 (Debian/Ubuntu)
+      command: dpkg --compare-versions "{{ initial_sudo_version }}" lt "{{ fixed_version_32462 }}"
+      register: initial_32462_deb_check
       changed_when: false
+      failed_when: false
+      when: >
+        ansible_os_family == "Debian" and
+        not cve_32462_not_affected and
+        initial_sudo_version != 'unknown'
 
-    - name: Check if CVEs are fixed in changelog
-      ansible.builtin.set_fact:
-        cve_2025_32462_fixed: "{{ 'CVE-2025-32462' in sudo_changelog.stdout }}"
-        cve_2025_32463_fixed: "{{ 'CVE-2025-32463' in sudo_changelog.stdout }}"
-        cve_2025_32462_fixed_post_update: "{{ 'CVE-2025-32462' in sudo_changelog.stdout }}"
-        cve_2025_32463_fixed_post_update: "{{ 'CVE-2025-32463' in sudo_changelog.stdout }}"
+    - name: Check initial vulnerability for CVE-2025-32463 (Debian/Ubuntu)
+      command: dpkg --compare-versions "{{ initial_sudo_version }}" lt "{{ fixed_version_32463 }}"
+      register: initial_32463_deb_check
+      changed_when: false
+      failed_when: false
+      when: >
+        ansible_os_family == "Debian" and
+        not cve_32463_not_affected and
+        initial_sudo_version != 'unknown'
 
-    - name: Check if sudo version is vulnerable to CVE-2025-32462
-      ansible.builtin.set_fact:
-        cve_2025_32462_vulnerable: "{{ not cve_2025_32462_fixed and (
-          (sudo_version is version('1.8.8', '>=') and sudo_version is version('1.8.32', '<=')) or
-          (sudo_version is version('1.9.0', '>=') and sudo_version is version('1.9.17', '<=')) ) }}"
+    - name: Check if rpmdev-vercmp is available (RedHat)
+      command: which rpmdev-vercmp
+      register: rpmdev_available
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "RedHat"
 
-    - name: Check if sudo version is vulnerable to CVE-2025-32463
-      ansible.builtin.set_fact:
-        cve_2025_32463_vulnerable: "{{ not cve_2025_32463_fixed and
-          (sudo_version is version('1.9.14', '>=') and sudo_version is version('1.9.17', '<=')) }}"
+    - name: Check initial vulnerability for CVE-2025-32462 (RedHat)
+      command: rpmdev-vercmp "{{ initial_sudo_version }}" "{{ fixed_version_32462 }}"
+      register: initial_32462_rpm_check
+      changed_when: false
+      failed_when: false
+      when: >
+        ansible_os_family == "RedHat" and
+        not cve_32462_not_affected and
+        initial_sudo_version != 'unknown' and
+        rpmdev_available.rc == 0
 
-    - name: Determine if update is needed
-      ansible.builtin.set_fact:
-        is_vulnerable: "{{ cve_2025_32462_vulnerable or cve_2025_32463_vulnerable }}"
+    - name: Check initial vulnerability for CVE-2025-32463 (RedHat)
+      command: rpmdev-vercmp "{{ initial_sudo_version }}" "{{ fixed_version_32463 }}"
+      register: initial_32463_rpm_check
+      changed_when: false
+      failed_when: false
+      when: >
+        ansible_os_family == "RedHat" and
+        not cve_32463_not_affected and
+        initial_sudo_version != 'unknown' and
+        rpmdev_available.rc == 0
 
-    - name: Debug vulnerability status
-      ansible.builtin.debug:
-        msg:
-          - "Vulnerability status for {{ inventory_hostname }}"
-          - "CVE-2025-32462 vulnerable: {{ cve_2025_32462_vulnerable }}"
-          - "CVE-2025-32463 vulnerable: {{ cve_2025_32463_vulnerable }}"
-          - "Is vulnerable: {{ is_vulnerable }}"
-          - "CVE-2025-32462 fixed: {{ cve_2025_32462_fixed }}"
-          - "CVE-2025-32463 fixed: {{ cve_2025_32463_fixed }}"
+    - name: Determine initial vulnerability status
+      set_fact:
+        initially_vulnerable_32462: >-
+          {{ false if cve_32462_not_affected or initial_sudo_version == 'unknown' else
+             (initial_32462_deb_check.rc == 0) if ansible_os_family == "Debian" and initial_32462_deb_check is defined and 'rc' in initial_32462_deb_check else
+             (initial_32462_rpm_check.rc == 11) if ansible_os_family == "RedHat" and initial_32462_rpm_check is defined and 'rc' in initial_32462_rpm_check else
+             false }}
+        initially_vulnerable_32463: >-
+          {{ false if cve_32463_not_affected or initial_sudo_version == 'unknown' else
+             (initial_32463_deb_check.rc == 0) if ansible_os_family == "Debian" and initial_32463_deb_check is defined and 'rc' in initial_32463_deb_check else
+             (initial_32463_rpm_check.rc == 11) if ansible_os_family == "RedHat" and initial_32463_rpm_check is defined and 'rc' in initial_32463_rpm_check else
+             false }}
 
-    - name: Determine if manual verification is needed
-      ansible.builtin.set_fact:
-        manual_verification_needed: "{{ not (cve_2025_32462_fixed and cve_2025_32463_fixed) and
-          sudo_version is version(fixed_sudo_version, '<') and not is_vulnerable }}"
-
-    - name: Report current sudo version and CVE status
-      ansible.builtin.debug:
-        msg:
-          - "Host: {{ inventory_hostname }}"
-          - "Current sudo version: {{ sudo_version }}"
-          - "CVE-2025-32462: {{ 'Not Vulnerable (backported fix)' if cve_2025_32462_fixed else 'Vulnerable' if cve_2025_32462_vulnerable else 'Not Vulnerable' }}"
-          - "CVE-2025-32463: {{ 'Not Vulnerable (backported fix)' if cve_2025_32463_fixed else 'Vulnerable' if cve_2025_32463_vulnerable else 'Not Vulnerable' }}"
-          - "Action required: {{ 'Update sudo to latest available version (includes backported patches)' if is_vulnerable else 'Manual verification needed' if manual_verification_needed else 'No action needed' }}"
-
-    - name: Update sudo package if vulnerable
-      ansible.builtin.yum:
+    - name: Update sudo package (Debian/Ubuntu)
+      apt:
         name: sudo
         state: latest
-      when: is_vulnerable
-      register: sudo_update
+        update_cache: yes
+      when: >
+        ansible_os_family == "Debian" and
+        (initially_vulnerable_32462 or initially_vulnerable_32463)
+      register: sudo_update_debian
 
-    - name: Debug yum update result
-      ansible.builtin.debug:
-        msg: "Yum update result: {{ sudo_update }}"
-      when: is_vulnerable
+    - name: Update sudo package (RedHat)
+      yum:
+        name: sudo
+        state: latest
+      when: >
+        ansible_os_family == "RedHat" and
+        (initially_vulnerable_32462 or initially_vulnerable_32463)
+      register: sudo_update_redhat
 
-    - name: Re-check sudo version after update
-      ansible.builtin.command: rpm -q sudo
-      register: sudo_version_post_update
+    - name: Gather package facts after update
+      ansible.builtin.package_facts:
+        manager: auto
+      when: >
+        (sudo_update_debian is defined and sudo_update_debian.changed) or
+        (sudo_update_redhat is defined and sudo_update_redhat.changed)
+
+    - name: Get final sudo version after update
+      shell: |
+        if command -v rpm >/dev/null 2>&1; then
+          # For RPM systems, strip distribution-specific suffixes like .el8_9, .el9, etc.
+          rpm -q --queryformat '%{VERSION}-%{RELEASE}' sudo 2>/dev/null | sed 's/\.el[0-9][_0-9]*.*$//' || echo "unknown"
+        elif command -v dpkg >/dev/null 2>&1; then
+          dpkg-query -W -f='${Version}' sudo 2>/dev/null || echo "unknown"
+        else
+          echo "unknown"
+        fi
+      register: final_detailed_sudo_version
       changed_when: false
-      when: sudo_update.changed
+      failed_when: false
+      when: >
+        (sudo_update_debian is defined and sudo_update_debian.changed) or
+        (sudo_update_redhat is defined and sudo_update_redhat.changed)
 
-    - name: Re-check changelog after update
-      ansible.builtin.command: rpm -q --changelog sudo
-      register: sudo_changelog_post_update
+    - name: Set final sudo version
+      set_fact:
+        final_sudo_version: >-
+          {{ final_detailed_sudo_version.stdout | default(initial_sudo_version) if final_detailed_sudo_version is defined else initial_sudo_version }}
+        update_performed: >-
+          {{ (sudo_update_debian is defined and sudo_update_debian.changed) or
+             (sudo_update_redhat is defined and sudo_update_redhat.changed) }}
+
+    - name: Check final vulnerability for CVE-2025-32462 (Debian/Ubuntu)
+      command: dpkg --compare-versions "{{ final_sudo_version }}" lt "{{ fixed_version_32462 }}"
+      register: final_32462_deb_check
       changed_when: false
-      when: sudo_update.changed
+      failed_when: false
+      when: >
+        ansible_os_family == "Debian" and
+        not cve_32462_not_affected and
+        final_sudo_version != 'unknown' and
+        update_performed
 
-    - name: Set updated CVE fix status
-      ansible.builtin.set_fact:
-        cve_2025_32462_fixed_post_update: "{{ 'CVE-2025-32462' in sudo_changelog_post_update.stdout }}"
-        cve_2025_32463_fixed_post_update: "{{ 'CVE-2025-32463' in sudo_changelog_post_update.stdout }}"
-        final_sudo_version: "{{ sudo_version_post_update.stdout | regex_replace('sudo-', '') | regex_replace('\\.el[0-9].*', '') }}"
-      when: sudo_update.changed
+    - name: Check final vulnerability for CVE-2025-32463 (Debian/Ubuntu)
+      command: dpkg --compare-versions "{{ final_sudo_version }}" lt "{{ fixed_version_32463 }}"
+      register: final_32463_deb_check
+      changed_when: false
+      failed_when: false
+      when: >
+        ansible_os_family == "Debian" and
+        not cve_32463_not_affected and
+        final_sudo_version != 'unknown' and
+        update_performed
 
-    - name: Print report to stdout
-      ansible.builtin.debug:
+    - name: Check final vulnerability for CVE-2025-32462 (RedHat)
+      command: rpmdev-vercmp "{{ final_sudo_version }}" "{{ fixed_version_32462 }}"
+      register: final_32462_rpm_check
+      changed_when: false
+      failed_when: false
+      when: >
+        ansible_os_family == "RedHat" and
+        not cve_32462_not_affected and
+        final_sudo_version != 'unknown' and
+        update_performed and
+        rpmdev_available.rc == 0
+
+    - name: Check final vulnerability for CVE-2025-32463 (RedHat)
+      command: rpmdev-vercmp "{{ final_sudo_version }}" "{{ fixed_version_32463 }}"
+      register: final_32463_rpm_check
+      changed_when: false
+      failed_when: false
+      when: >
+        ansible_os_family == "RedHat" and
+        not cve_32463_not_affected and
+        final_sudo_version != 'unknown' and
+        update_performed and
+        rpmdev_available.rc == 0
+
+    - name: Determine final vulnerability status
+      set_fact:
+        final_vulnerable_32462: >-
+          {{ false if cve_32462_not_affected else
+             false if not initially_vulnerable_32462 else
+             false if not update_performed else
+             (final_32462_deb_check.rc == 0) if ansible_os_family == "Debian" and final_32462_deb_check is defined and 'rc' in final_32462_deb_check else
+             (final_32462_rpm_check.rc == 11) if ansible_os_family == "RedHat" and final_32462_rpm_check is defined and 'rc' in final_32462_rpm_check else
+             initially_vulnerable_32462 }}
+        final_vulnerable_32463: >-
+          {{ false if cve_32463_not_affected else
+             false if not initially_vulnerable_32463 else
+             false if not update_performed else
+             (final_32463_deb_check.rc == 0) if ansible_os_family == "Debian" and final_32463_deb_check is defined and 'rc' in final_32463_deb_check else
+             (final_32463_rpm_check.rc == 11) if ansible_os_family == "RedHat" and final_32463_rpm_check is defined and 'rc' in final_32463_rpm_check else
+             initially_vulnerable_32463 }}
+
+    - name: Set CVE status messages
+      set_fact:
+        cve_32462_status: >-
+          {{ 'Not Affected' if cve_32462_not_affected else
+             'Fixed' if initially_vulnerable_32462 and not final_vulnerable_32462 else
+             'Already Patched' if not initially_vulnerable_32462 else
+             'Still Vulnerable' if final_vulnerable_32462 else
+             'Not Vulnerable' }}
+        cve_32463_status: >-
+          {{ 'Not Affected' if cve_32463_not_affected else
+             'Fixed' if initially_vulnerable_32463 and not final_vulnerable_32463 else
+             'Already Patched' if not initially_vulnerable_32463 else
+             'Still Vulnerable' if final_vulnerable_32463 else
+             'Not Vulnerable' }}
+        action_taken: >-
+          {{ 'Sudo updated successfully' if update_performed else
+             'No update needed - already patched' if not initially_vulnerable_32462 and not initially_vulnerable_32463 else
+             'No update performed - may need manual intervention' }}
+
+#    - name: Generate CVE report
+#      copy:
+#        content: |
+#          Sudo CVE Report for {{ inventory_hostname }}
+#          ==========================================
+#          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+#          
+#          Sudo Versions:
+#          - Initial: {{ initial_sudo_version }}
+#          - Final: {{ final_sudo_version }}
+#          
+#          CVE Status:
+#          - CVE-2025-32462: {{ cve_32462_status }}
+#          - CVE-2025-32463: {{ cve_32463_status }}
+#          
+#          Action Taken: {{ action_taken }}
+#          
+#          Required Fixed Versions:
+#          - CVE-2025-32462: {{ fixed_version_32462 }}
+#          - CVE-2025-32463: {{ fixed_version_32463 }}
+#          
+#          Initially Vulnerable:
+#          - CVE-2025-32462: {{ initially_vulnerable_32462 }}
+#          - CVE-2025-32463: {{ initially_vulnerable_32463 }}
+#          ==========================================
+#        dest: "/tmp/sudo_cve_report_{{ inventory_hostname }}.txt"
+#      delegate_to: localhost
+
+    - name: Print final CVE report
+      debug:
         msg:
+          - "=========================================="
           - "Sudo CVE Report for {{ inventory_hostname }}"
-          - "---------------------------------------"
-          - "Initial sudo version: {{ sudo_version }}"
-          - "Final sudo version: {{ final_sudo_version }}"
-          - "CVE-2025-32462: {{ 'Not Vulnerable (backported fix)' if cve_2025_32462_fixed_post_update else 'Vulnerable' if cve_2025_32462_vulnerable else 'Not Vulnerable' }}"
-          - "CVE-2025-32463: {{ 'Not Vulnerable (backported fix)' if cve_2025_32463_fixed_post_update else 'Vulnerable' if cve_2025_32463_vulnerable else 'Not Vulnerable' }}"
-          - "Action taken: {{ 'Sudo updated to latest available version (includes backported patches)' if sudo_update.changed else 'No update performed (already latest or backported fixes detected)' }}"
-          - "Manual verification needed: {{ 'Yes' if manual_verification_needed and not is_vulnerable else 'No' }}"
-          - "---------------------------------------"
+          - "=========================================="
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - ""
+          - "Sudo Versions:"
+          - "  Initial: {{ initial_sudo_version }}"
+          - "  Final: {{ final_sudo_version }}"
+          - ""
+          - "CVE Status:"
+          - "  CVE-2025-32462: {{ cve_32462_status }}"
+          - "  CVE-2025-32463: {{ cve_32463_status }}"
+          - ""
+          - "Action Taken: {{ action_taken }}"
+          - ""
+          - "Required Fixed Versions:"
+          - "  CVE-2025-32462: {{ fixed_version_32462 }}"
+          - "  CVE-2025-32463: {{ fixed_version_32463 }}"
+          - ""
+          - "Initially Vulnerable:"
+          - "  CVE-2025-32462: {{ initially_vulnerable_32462 }}"
+          - "  CVE-2025-32463: {{ initially_vulnerable_32463 }}"            
+          - "=========================================="
+
+  handlers:
+    - name: sudo_updated
+      debug:
+        msg: "Sudo package was updated on {{ inventory_hostname }}."
