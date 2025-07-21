@@ -1,0 +1,79 @@
+---
+- name: Register RHEL hosts to CDN or Satellite
+  hosts: rhel
+  become: yes
+  gather_facts: yes
+
+  vars:
+    use_cdn: true                     # true = CDN, false = Satellite
+    force_register: true             # Force clean re-registration by default
+
+    # CDN credentials
+    rhsm_username: your_rhsm_username
+    rhsm_password: your_rhsm_password
+
+    # Satellite registration
+    satellite_org_id: your-org-ID
+    satellite_fqdn: satellite.kifarunix.com
+
+    # Activation keys per OS major version
+    rhel_activation_keys:
+      "6": "rhel6"
+      "7": "rhel7"
+      "8": "rhel8"
+      "9": "rhel9"
+
+  tasks:
+    - name: Set activation key based on OS major version
+      set_fact:
+        satellite_activation_key: "{{ rhel_activation_keys[ansible_distribution_major_version] }}"
+
+    - name: Full RHSM cleanup (unregister, remove, clean)
+      shell: |
+        subscription-manager unregister || true
+        subscription-manager remove --all || true
+        subscription-manager clean || true
+      when: force_register
+
+    - name: Clean old RHSM certificates and facts
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/pki/consumer
+        - /etc/pki/entitlement
+        - /etc/rhsm/facts
+      when: force_register
+
+    - name: Uninstall Katello CA consumer RPM
+      yum:
+        name: "katello-ca-consumer*"
+        state: absent
+        autoremove: yes
+      when: not use_cdn
+
+    - name: Install Katello CA consumer RPM
+      yum:
+        name: "https://{{ satellite_fqdn }}/pub/katello-ca-consumer-latest.noarch.rpm"
+        state: present
+      when: not use_cdn
+
+    - name: Configure no_proxy and register to Satellite
+      shell: |
+        subscription-manager config --server.no_proxy=*.{{ satellite_fqdn | regex_replace('^.*?([^.]+\.[^.]+)$', '\\1') }}
+        subscription-manager register \
+        --org="{{ satellite_org_id }}" \
+        --activationkey="{{ satellite_activation_key }}" \
+        --force
+      when: not use_cdn
+
+    - name: Register to Red Hat CDN
+      command: >
+        subscription-manager register
+        --username="{{ rhsm_username }}"
+        --password="{{ rhsm_password }}"
+        --force
+      when: use_cdn
+
+    - name: Refresh subscription
+      command: subscription-manager refresh
