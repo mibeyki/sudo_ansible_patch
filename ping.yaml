@@ -1,0 +1,6 @@
+- name: Check server reachability of hosts
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Verify Hosts Connectivity
+      ping:
