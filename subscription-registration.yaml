@@ -5,12 +5,12 @@
   gather_facts: yes
 
   vars:
-    use_cdn: true                     # true = CDN, false = Satellite
+    use_cdn: true                    # true = CDN, false = Satellite
     force_register: true             # Force clean re-registration by default
 
     # CDN credentials
-    rhsm_username: your_rhsm_username
-    rhsm_password: your_rhsm_password
+    rhsm_username: cobagag
+    rhsm_password: OSkip@2023pass
 
     # Satellite registration
     satellite_org_id: your-org-ID
@@ -50,7 +50,6 @@
         name: "katello-ca-consumer*"
         state: absent
         autoremove: yes
-      when: not use_cdn
 
     - name: Install Katello CA consumer RPM
       yum:
