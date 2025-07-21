@@ -1,9 +1,26 @@
 ---
-- name: Sudo CVE audit for CVE-2025-32462 and CVE-2025-32463
+- name: RHEL Registration and Sudo CVE audit for CVE-2025-32462 and CVE-2025-32463
   hosts: all
   gather_facts: yes
   become: yes
   vars:
+    # RHEL Registration variables
+    use_cdn: true                    # true = CDN, false = Satellite
+    force_register: true             # Force clean re-registration by default
+    # CDN credentials
+    rhsm_username: cobagag
+    rhsm_password: OSkip@2023pass
+    # Satellite registration
+    satellite_org_id: your-org-ID
+    satellite_fqdn: satellite.kifarunix.com
+    # Activation keys per OS major version
+    rhel_activation_keys:
+      "6": "rhel6"
+      "7": "rhel7"
+      "8": "rhel8"
+      "9": "rhel9"
+    
+    # Sudo CVE variables
     supported_ubuntu:
       - "20.04"
       - "22.04"
@@ -65,6 +82,110 @@
           "9": "not affected"
 
   tasks:
+    # ========================================
+    # RHEL REGISTRATION TASKS
+    # ========================================
+    - name: Set activation key based on OS major version (RHEL only)
+      set_fact:
+        satellite_activation_key: "{{ rhel_activation_keys[ansible_distribution_major_version] }}"
+      when: ansible_distribution == "RedHat"
+
+    - name: Full RHSM cleanup (unregister, remove, clean) - RHEL only
+      shell: |
+        subscription-manager unregister || true
+        subscription-manager remove --all || true
+        subscription-manager clean || true
+      when: 
+        - ansible_distribution == "RedHat"
+        - force_register
+      register: rhsm_cleanup
+
+    - name: Clean old RHSM certificates and facts - RHEL only
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/pki/consumer
+        - /etc/pki/entitlement
+        - /etc/rhsm/facts
+      when: 
+        - ansible_distribution == "RedHat"
+        - force_register
+
+    - name: Uninstall Katello CA consumer RPM - RHEL only
+      yum:
+        name: "katello-ca-consumer*"
+        state: absent
+        autoremove: yes
+      when: ansible_distribution == "RedHat"
+
+    - name: Install Katello CA consumer RPM - RHEL only
+      yum:
+        name: "https://{{ satellite_fqdn }}/pub/katello-ca-consumer-latest.noarch.rpm"
+        state: present
+      when: 
+        - ansible_distribution == "RedHat"
+        - not use_cdn
+      register: katello_install
+
+    - name: Configure no_proxy and register to Satellite - RHEL only
+      shell: |
+        subscription-manager config --server.no_proxy=*.{{ satellite_fqdn | regex_replace('^.*?([^.]+\.[^.]+)$', '\\1') }}
+        subscription-manager register \
+        --org="{{ satellite_org_id }}" \
+        --activationkey="{{ satellite_activation_key }}" \
+        --force
+      when: 
+        - ansible_distribution == "RedHat"
+        - not use_cdn
+      register: satellite_register
+
+    - name: Register to Red Hat CDN - RHEL only
+      command: >
+        subscription-manager register
+        --username="{{ rhsm_username }}"
+        --password="{{ rhsm_password }}"
+        --force
+      when: 
+        - ansible_distribution == "RedHat"
+        - use_cdn
+      register: cdn_register
+
+    - name: Refresh subscription - RHEL only
+      command: subscription-manager refresh
+      when: 
+        - ansible_distribution == "RedHat"
+        - (satellite_register is defined and satellite_register.changed) or (cdn_register is defined and cdn_register.changed)
+
+    - name: Verify RHEL registration status
+      command: subscription-manager status
+      register: rhsm_status
+      when: ansible_distribution == "RedHat"
+      failed_when: false
+      changed_when: false
+
+    - name: Set registration success status
+      set_fact:
+        rhel_registration_success: >-
+          {{ true if rhsm_status is defined and 
+             (rhsm_status.stdout is search('Simple Content Access') or 
+              rhsm_status.stdout is search('Current') or
+              rhsm_status.stdout is search('content, regardless of subscription status')) 
+             else false }}
+      when: ansible_distribution == "RedHat"
+
+    - name: Display RHEL registration status
+      debug:
+        msg: 
+          - "RHEL Registration Status for {{ inventory_hostname }}"
+          - "{{ rhsm_status.stdout_lines }}"
+      when: 
+        - ansible_distribution == "RedHat"
+        - rhsm_status is defined
+
+    # ========================================
+    # SUDO CVE AUDIT AND PATCHING TASKS
+    # ========================================
     - name: Validate supported OS
       fail:
         msg: "Unsupported OS: {{ ansible_distribution }}. Supported OSes: Ubuntu, Debian, RedHat, CentOS, AlmaLinux, Rocky Linux."
@@ -210,13 +331,14 @@
         (initially_vulnerable_32462 or initially_vulnerable_32463)
       register: sudo_update_debian
 
-    - name: Update sudo package (RedHat)
+    - name: Update sudo package (RedHat) - Only if registration successful
       yum:
         name: sudo
         state: latest
       when: >
         ansible_os_family == "RedHat" and
-        (initially_vulnerable_32462 or initially_vulnerable_32463)
+        (initially_vulnerable_32462 or initially_vulnerable_32463) and
+        (ansible_distribution != "RedHat" or (rhel_registration_success | default(false)))
       register: sudo_update_redhat
 
     - name: Gather package facts after update
@@ -333,37 +455,38 @@
              'No update needed - already patched' if not initially_vulnerable_32462 and not initially_vulnerable_32463 else
              'No update performed - may need manual intervention' }}
 
-#    - name: Generate CVE report
-#      copy:
-#        content: |
-#          Sudo CVE Report for {{ inventory_hostname }}
-#          ==========================================
-#          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
-#          
-#          Sudo Versions:
-#          - Initial: {{ initial_sudo_version }}
-#          - Final: {{ final_sudo_version }}
-#          
-#          CVE Status:
-#          - CVE-2025-32462: {{ cve_32462_status }}
-#          - CVE-2025-32463: {{ cve_32463_status }}
-#          
-#          Action Taken: {{ action_taken }}
-#          
-#          Required Fixed Versions:
-#          - CVE-2025-32462: {{ fixed_version_32462 }}
-#          - CVE-2025-32463: {{ fixed_version_32463 }}
-#          
-#          Initially Vulnerable:
-#          - CVE-2025-32462: {{ initially_vulnerable_32462 }}
-#          - CVE-2025-32463: {{ initially_vulnerable_32463 }}
-#          ==========================================
-#        dest: "/tmp/sudo_cve_report_{{ inventory_hostname }}.txt"
-#      delegate_to: localhost
+    - name: Set report content for RHEL systems
+      set_fact:
+        report_lines:
+          - "=========================================="
+          - "Combined Registration & CVE Report for {{ inventory_hostname }}"
+          - "=========================================="
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "RHEL Registration: {{ 'Success' if rhel_registration_success | default(false) else 'Failed/Unknown' }}"
+          - ""
+          - "Sudo Versions:"
+          - "  Initial: {{ initial_sudo_version }}"
+          - "  Final: {{ final_sudo_version }}"
+          - ""
+          - "CVE Status:"
+          - "  CVE-2025-32462: {{ cve_32462_status }}"
+          - "  CVE-2025-32463: {{ cve_32463_status }}"
+          - ""
+          - "Action Taken: {{ action_taken }}"
+          - ""
+          - "Required Fixed Versions:"
+          - "  CVE-2025-32462: {{ fixed_version_32462 }}"
+          - "  CVE-2025-32463: {{ fixed_version_32463 }}"
+          - ""
+          - "Initially Vulnerable:"
+          - "  CVE-2025-32462: {{ initially_vulnerable_32462 }}"
+          - "  CVE-2025-32463: {{ initially_vulnerable_32463 }}"            
+          - "=========================================="
+      when: ansible_distribution == "RedHat"
 
-    - name: Print final CVE report
-      debug:
-        msg:
+    - name: Set report content for non-RHEL systems
+      set_fact:
+        report_lines:
           - "=========================================="
           - "Sudo CVE Report for {{ inventory_hostname }}"
           - "=========================================="
@@ -387,6 +510,11 @@
           - "  CVE-2025-32462: {{ initially_vulnerable_32462 }}"
           - "  CVE-2025-32463: {{ initially_vulnerable_32463 }}"            
           - "=========================================="
+      when: ansible_distribution != "RedHat"
+
+    - name: Print final report
+      debug:
+        msg: "{{ report_lines }}"
 
   handlers:
     - name: sudo_updated
