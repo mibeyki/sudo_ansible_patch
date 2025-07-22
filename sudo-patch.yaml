@@ -121,8 +121,9 @@
 
     - name: Install Katello CA consumer RPM - RHEL only
       yum:
-        name: "https://{{ satellite_fqdn }}/pub/katello-ca-consumer-latest.noarch.rpm"
+        name: "http://{{ satellite_fqdn }}/pub/katello-ca-consumer-latest.noarch.rpm"
         state: present
+        disable_gpg_check: yes
       when: 
         - ansible_distribution == "RedHat"
         - not use_cdn
