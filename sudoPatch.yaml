@@ -1,0 +1,157 @@
+---
+- name: Compile, install and backup custom sudo on RHEL-family systems
+  hosts: all
+  become: true
+  vars:
+    sudo_version: "1.9.17p1"
+    sudo_url: "https://www.sudo.ws/dist/sudo-{{ sudo_version }}.tar.gz"
+    sudo_src_dir: "/usr/local/src/sudo-{{ sudo_version }}"
+    sudo_backup_dir: "/etc/sudo-backups-{{ lookup('pipe', 'date +%Y-%m-%d') }}"
+    sudo_backup_binary: "{{ sudo_backup_dir }}/sudo"
+
+  tasks:
+
+    - name: Create backup directory
+      file:
+        path: "{{ sudo_backup_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Backup sudo binary (preserve ownership and setuid)
+      shell: |
+        cp -a /usr/bin/sudo "{{ sudo_backup_binary }}"
+      args:
+        executable: /bin/bash
+
+    - name: Backup sudoers.d directory (preserve all attributes)
+      shell: |
+        mkdir -p "{{ sudo_backup_dir }}/sudoers.d"
+        cp -a /etc/sudoers.d/. "{{ sudo_backup_dir }}/sudoers.d/"
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    - name: Backup PAM config for sudo (if exists)
+      copy:
+        src: /etc/pam.d/sudo
+        dest: "{{ sudo_backup_dir }}/pam.d_sudo"
+        remote_src: yes
+      ignore_errors: yes
+
+    - name: Backup PAM config for sudo-i (if exists)
+      copy:
+        src: /etc/pam.d/sudo-i
+        dest: "{{ sudo_backup_dir }}/pam.d_sudo-i"
+        remote_src: yes
+      ignore_errors: yes
+
+    - name: Backup sudo plugins directory (if exists)
+      shell: |
+        mkdir -p "{{ sudo_backup_dir }}/plugins"
+        cp -a /usr/libexec/sudo/. "{{ sudo_backup_dir }}/plugins/"
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    - name: Ensure required packages are installed
+      dnf:
+        name:
+          - "@Development Tools"
+          - wget
+          - make
+          - gcc
+          - libselinux-devel
+          - pam-devel
+          - openldap-devel
+        state: present
+      #environment:
+        #http_proxy: "{{ http_proxy }}"
+        #https_proxy: "{{ https_proxy }}"
+
+    - name: Create source directory
+      file:
+        path: /usr/local/src
+        state: directory
+        mode: '0755'
+
+    - name: Download sudo source archive
+      get_url:
+        url: "{{ sudo_url }}"
+        dest: "/usr/local/src/sudo-{{ sudo_version }}.tar.gz"
+        mode: '0644'
+        validate_certs: no
+      #environment:
+        #http_proxy: "{{ http_proxy }}"
+        #https_proxy: "{{ https_proxy }}"
+
+    - name: Extract sudo source
+      unarchive:
+        src: "/usr/local/src/sudo-{{ sudo_version }}.tar.gz"
+        dest: "/usr/local/src/"
+        remote_src: yes
+
+    - name: Configure sudo source
+      command: ./configure --prefix=/usr --with-pam --with-ldap --with-logging=syslog
+      args:
+        chdir: "{{ sudo_src_dir }}"
+
+    - name: Compile sudo
+      command: make
+      args:
+        chdir: "{{ sudo_src_dir }}"
+
+    - name: Install sudo
+      command: make install
+      args:
+        chdir: "{{ sudo_src_dir }}"
+
+    - name: Set ownership and permissions for sudo binary after install
+      file:
+        path: /usr/bin/sudo
+        owner: root
+        group: root
+        mode: '4755'  # setuid + executable
+
+    - name: Verify sudo version
+      command: sudo --version
+      register: sudo_version_output
+
+    - name: Display sudo version
+      debug:
+        var: sudo_version_output.stdout_lines
+
+# Optional restore task example (run manually if needed):
+#
+# - name: Restore sudo binary from backup
+#   copy:
+#     src: "{{ sudo_backup_dir }}/sudo"
+#     dest: /usr/bin/sudo
+#     remote_src: yes
+#     owner: root
+#     group: root
+#     mode: '4755'
+#
+# - name: Restore sudoers.d directory from backup
+#   shell: |
+#     cp -a "{{ sudo_backup_dir }}/sudoers.d/." /etc/sudoers.d/
+#   args:
+#     executable: /bin/bash
+#   ignore_errors: yes
+#
+# - name: Restore PAM configs
+#   copy:
+#     src: "{{ sudo_backup_dir }}/pam.d_sudo"
+#     dest: /etc/pam.d/sudo
+#     remote_src: yes
+#     owner: root
+#     group: root
+#     mode: '0644'
+#   ignore_errors: yes
+#
+# - name: Restore sudo plugins directory from backup
+#   shell: |
+#     cp -a "{{ sudo_backup_dir }}/plugins/." /usr/libexec/sudo/
+#   args:
+#     executable: /bin/bash
+#   ignore_errors: yes
+
